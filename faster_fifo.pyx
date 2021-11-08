@@ -8,6 +8,9 @@ import multiprocessing
 from ctypes import c_size_t
 from multiprocessing import context
 from queue import Full, Empty
+import pickle
+
+import shared_memory
 
 _ForkingPickler = context.reduction.ForkingPickler
 
@@ -23,10 +26,10 @@ cdef size_t caddr(buf):
     return buffer_ptr
 
 cdef size_t q_addr(q):
-    return caddr(q.queue_obj_buffer)
+    return ctypes.addressof(ctypes.c_ubyte.from_buffer(q.shm.buf, q.queue_obj_buffer_offest))
 
 cdef size_t buf_addr(q):
-    return caddr(q.shared_memory)
+    return ctypes.addressof(ctypes.c_ubyte.from_buffer(q.shm.buf, q.shared_memory_offset))
 
 cdef size_t msg_buf_addr(q):
     return caddr(q.message_buffer)
@@ -37,17 +40,29 @@ cdef size_t bytes_to_ptr(b):
 
 
 class Queue:
-    def __init__(self, max_size_bytes=DEFAULT_CIRCULAR_BUFFER_SIZE):
+    def __init__(self, max_size_bytes=DEFAULT_CIRCULAR_BUFFER_SIZE, create=True, name=None):
         self.max_size_bytes = max_size_bytes
         self.max_bytes_to_read = self.max_size_bytes  # by default, read the whole queue if necessary
+        self.create = create
 
+        # TODO: change to shared memory
         self.closed = multiprocessing.RawValue(ctypes.c_bool, False)
 
         queue_obj_size = Q.queue_object_size()
-        self.queue_obj_buffer = multiprocessing.RawArray(ctypes.c_ubyte, queue_obj_size)
-        self.shared_memory = multiprocessing.RawArray(ctypes.c_ubyte, max_size_bytes)
+        # self.queue_obj_buffer = multiprocessing.RawArray(ctypes.c_ubyte, queue_obj_size)
+        # self.shared_memory = multiprocessing.RawArray(ctypes.c_ubyte, max_size_bytes)
 
-        Q.create_queue(<void *> q_addr(self), max_size_bytes)
+        # assign the offset, first is Queue Obj offset, next is Shared Buffer offset.
+        self.queue_obj_buffer_offest = 0
+        self.shared_memory_offset = queue_obj_size
+        
+        if create == True:
+            self.shm = shared_memory.SharedMemory(create=True, name=name, size=queue_obj_size+max_size_bytes)
+            Q.create_queue(<void *> q_addr(self), max_size_bytes)
+        else:
+            if name == None:
+                raise ValueError("'name' can only be None if create=True")
+            self.shm = shared_memory.SharedMemory(create=False, name=name)
 
         self.message_buffer = None
         self.message_buffer_memview = None
@@ -58,6 +73,9 @@ class Queue:
         only one process, e.g. main process.
         """
         self.closed.value = True
+        if self.create == True:
+            self.shm.close()
+            self.shm.unlink()
 
     def is_closed(self):
         """
@@ -68,7 +86,7 @@ class Queue:
 
     def put_many(self, xs, block=True, timeout=DEFAULT_TIMEOUT):
         assert isinstance(xs, (list, tuple))
-        xs = [_ForkingPickler.dumps(ele).tobytes() for ele in xs]
+        xs = [pickle.dumps(ele) for ele in xs]
 
         _len = len
         msgs_buf = (c_size_t * _len(xs))()
@@ -195,7 +213,7 @@ class Queue:
 
             msg_bytes = self.message_buffer_memview[offset:offset + msg_size.value]
             offset += msg_size.value
-            msg = _ForkingPickler.loads(msg_bytes)
+            msg = pickle.loads(msg_bytes)
             messages[msg_idx] = msg
 
         assert total_bytes == offset

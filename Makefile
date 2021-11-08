@@ -3,6 +3,10 @@
 build: setup.py
 	python3 setup.py sdist
 
+install: setup.py
+	python setup.py build_ext --inplace
+	pip install -e .
+	
 .PHONY: upload
 
 upload:
